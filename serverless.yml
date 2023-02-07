@@ -1,0 +1,206 @@
+# Service name
+service: serverless-playground
+
+# Ensure configuration validation issues fail the command (safest option)
+configValidationMode: error
+
+# Package individually as multiple lambdas created
+package:
+  individually: true
+
+# Define plugins
+plugins:
+  - serverless-scriptable-plugin
+  - serverless-s3-sync
+
+provider:
+  name: aws
+  region: eu-west-1
+
+  # Use direct deployments (faster). This is going to become the default in v4.
+  # See https://www.serverless.com/framework/docs/providers/aws/guide/deploying#deployment-method
+  deploymentMethod: direct
+
+  # Ensure Lambdas can access Assets S3 Bucket
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - "s3:GetObject"
+          Resource:
+            - "arn:aws:s3:::${self:service}-assets/*"
+
+functions:
+  imageOptimization:
+    name: ${self:service}-image-optimization
+    description: Image Optimization Lambda for Next.js App
+    handler: index.handler
+    runtime: nodejs18.x
+    architecture: arm64
+    memorySize: 1024
+    # We need a Function URL to use for the CloudFront Origin URL
+    url: true
+    package:
+      artifact: .open-next/zips/image-optimization-function.zip
+    # Set S3 BUCKET_NAME for Image Optimization Lambda to use
+    environment:
+      BUCKET_NAME: ${self:service}-assets
+  server:
+    name: ${self:service}-server
+    description: Server Lambda for Next.js App
+    handler: index.handler
+    runtime: nodejs18.x
+    architecture: arm64
+    memorySize: 512
+    # We need a Function URL to use for the CloudFront Origin URL
+    url: true
+    package:
+      artifact: .open-next/zips/server-function.zip
+
+custom:
+  scriptable:
+    hooks:
+      before:package:createDeploymentArtifacts:
+        - npx open-next@latest build
+        - mkdir -p ./.open-next/zips
+        - cd .open-next/server-function && zip -r ../zips/server-function.zip .
+        - cd .open-next/image-optimization-function && zip -r ../zips/image-optimization-function.zip .
+  s3Sync:
+    - bucketName: ${self:service}-assets
+      localDir: .open-next/assets
+      params: # Cache control
+        # Un-hashed files, should be cached at the CDN level, but not at the browser level
+        - "**/*":
+            CacheControl: "public,max-age=0,s-maxage=31536000,must-revalidate"
+        # Hashed files, should be cached both at the CDN level and at the browser level
+        - "_next/**/*":
+            CacheControl: "public,max-age=31536000,immutable"
+
+resources:
+  Description: Next App Infrastructure
+  Resources:
+    # S3 Bucket for assets
+    AssetsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:service}-assets
+    # S3 Bucket Policy to allow access from CloudFront Origin Access Control (OAC)
+    AssetsBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref AssetsBucket
+        PolicyDocument:
+          Statement:
+            - Action: s3:GetObject
+              Effect: Allow
+              Resource: !Sub ${AssetsBucket.Arn}/*
+              Principal: '*'
+    CloudFrontDistribution:
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          Enabled: true
+          PriceClass: PriceClass_All
+          # List of origins. S3 Bucket, Server function, and Image Optimization function
+          Origins:
+            - Id: StaticAssetOrigin
+              DomainName: !GetAtt AssetsBucket.DomainName
+              S3OriginConfig:
+                OriginAccessIdentity: ""
+              OriginAccessControlId: !GetAtt CloudFrontAccessToS3Bucket.Id
+            - Id: ImageOptimizationFunctionOrigin
+              # Remove https:// from URL
+              DomainName: !Select [2, !Split ["/", !GetAtt ImageOptimizationLambdaFunctionUrl.FunctionUrl]]
+              CustomOriginConfig:
+                HTTPSPort: 443
+                OriginProtocolPolicy: https-only
+            - Id: ServerFunctionOrigin
+              # Remove https:// from URL
+              DomainName: !Select [2, !Split ["/", !GetAtt ServerLambdaFunctionUrl.FunctionUrl]]
+              CustomOriginConfig:
+                HTTPSPort: 443
+                OriginProtocolPolicy: https-only
+          # We need a "failover" Origin Group to try the "Server function" origin first, then fallback to the S3 bucket origin if the server function fails
+          OriginGroups:
+            Quantity: 1
+            Items:
+              - Id: ServerAndStaticAssetOriginGroup
+                FailoverCriteria:
+                  StatusCodes:
+                    Quantity: 2
+                    Items:
+                      - 500
+                      - 502
+                Members:
+                  Quantity: 2
+                  Items:
+                    - OriginId: ServerFunctionOrigin
+                    - OriginId: StaticAssetOrigin
+          # Default is used by /* resources
+          DefaultCacheBehavior:
+            MinTTL: 0
+            DefaultTTL: 0
+            MaxTTL: 31536000
+            TargetOriginId: ServerAndStaticAssetOriginGroup
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: ["GET", "HEAD", "OPTIONS"]
+            CachedMethods: ["HEAD", "GET"]
+            Compress: true
+            ForwardedValues:
+              QueryString: true
+              Headers:
+                - x-op-middleware-request-headers
+                - x-op-middleware-response-headers
+                - x-nextjs-data
+                - x-middleware-prefetch
+              Cookies:
+                Forward: all
+          CacheBehaviors:
+            - TargetOriginId: StaticAssetOrigin
+              ViewerProtocolPolicy: https-only
+              PathPattern: /_next/static/*
+              Compress: true
+              AllowedMethods: ["GET", "HEAD", "OPTIONS"]
+              CachedMethods: ["HEAD", "GET"]
+              ForwardedValues:
+                QueryString: false
+            - TargetOriginId: ServerFunctionOrigin
+              ViewerProtocolPolicy: https-only
+              PathPattern: /api/*
+              AllowedMethods:
+                ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+              ForwardedValues:
+                QueryString: true
+                Cookies:
+                  Forward: all
+                Headers: ["Authorization", "Accept-Language"]
+            - TargetOriginId: ImageOptimizationFunctionOrigin
+              ViewerProtocolPolicy: https-only
+              PathPattern: /_next/image
+              AllowedMethods:
+                ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+              ForwardedValues:
+                QueryString: true
+                Headers: ["Accept"]
+            - TargetOriginId: ServerFunctionOrigin
+              ViewerProtocolPolicy: https-only
+              PathPattern: /_next/data/*
+              AllowedMethods: ["GET", "HEAD"]
+              ForwardedValues:
+                QueryString: true
+                Cookies:
+                  Forward: all
+                Headers:
+                  - x-op-middleware-request-headers
+                  - x-op-middleware-response-headers
+                  - x-nextjs-data
+                  - x-middleware-prefetch
+    CloudFrontAccessToS3Bucket:
+      Type: AWS::CloudFront::OriginAccessControl
+      Properties:
+        OriginAccessControlConfig:
+          Name: CloudFrontAccessToS3BucketOriginAccess
+          OriginAccessControlOriginType: s3
+          SigningBehavior: always
+          SigningProtocol: sigv4
