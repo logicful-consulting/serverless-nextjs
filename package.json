@@ -5,7 +5,8 @@
     "start": "next start",
     "lint": "next lint",
     "deploy": "serverless deploy --aws-profile logicful",
-    "bust": "export AWS_PROFILE=logicful && aws cloudfront create-invalidation --distribution-id E2I0FLUDI4RCJK --paths '/*'"
+    "bust": "export AWS_PROFILE=logicful && aws cloudfront create-invalidation --distribution-id E2I0FLUDI4RCJK --paths '/*'",
+    "test": "jest"
   },
   "dependencies": {
     "axios": "^1.3.2",
@@ -16,9 +17,17 @@
     "styled-components": "^5.3.6"
   },
   "devDependencies": {
+    "@testing-library/dom": "^8.20.0",
+    "@testing-library/jest-dom": "^5.16.5",
+    "@testing-library/react": "^13.4.0",
+    "@testing-library/user-event": "^14.4.3",
+    "@types/jest": "^29.4.0",
     "@types/node": "18.13.0",
     "@types/react": "18.0.27",
+    "babel-jest": "^29.4.2",
     "esbuild": "^0.16.17",
+    "jest": "^29.4.2",
+    "jest-environment-jsdom": "^29.4.2",
     "serverless-esbuild": "^1.37.3",
     "serverless-http": "^3.1.1",
     "serverless-scriptable-plugin": "^1.2.2",
